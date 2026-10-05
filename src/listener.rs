@@ -7,28 +7,23 @@
 //! horizon it looks again on a short backoff, and when idle it still looks
 //! every `idle_poll` in case a notification was missed.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
-use tokio::sync::broadcast;
 
 use crate::health::{health_on, stall_report};
-use crate::recent::Recent;
-use crate::{Config, Message, Position, backlog_on, pending_after};
+use crate::stats::Counters;
+use crate::{Config, Position, Shared, backlog_on, pending_after};
 
 /// Messages read per query; a full batch is followed by another at once.
 const BATCH: i64 = 500;
 
-pub(crate) async fn run(
-    pool: PgPool,
-    config: Config,
-    feed: broadcast::Sender<Arc<Message>>,
-    recent: Arc<Mutex<Recent>>,
-    mut cursor: Position,
-) {
+pub(crate) async fn run(pool: PgPool, config: Config, shared: Arc<Shared>, mut cursor: Position) {
+    let counters = &shared.counters;
     let mut retry = config.min_poll;
+    let mut connected_before = false;
     loop {
         let mut listener = match connect(&pool, &config.schema).await {
             Ok(l) => l,
@@ -39,11 +34,16 @@ pub(crate) async fn run(
                 continue;
             }
         };
+        if connected_before {
+            Counters::add(&counters.listener_reconnects, 1);
+            tracing::debug!("pg-bus: listener reconnected");
+        }
+        connected_before = true;
         retry = config.min_poll;
         let mut wait = config.min_poll;
         let mut stall = StallWatch::default();
         loop {
-            match drain(&pool, &config.schema, &feed, &recent, &mut cursor).await {
+            match drain(&pool, &config.schema, &shared, &mut cursor).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::warn!("pg-bus: listener could not read the backlog: {e}");
@@ -51,6 +51,7 @@ pub(crate) async fn run(
                     continue;
                 }
             }
+            Counters::add(&counters.listener_queries, 1);
             let pending = pending_after(&pool, &config.schema, cursor)
                 .await
                 .unwrap_or(true);
@@ -66,7 +67,13 @@ pub(crate) async fn run(
                 config.idle_poll
             };
             match next_notification(&mut listener, delay).await {
-                Ok(()) => {}
+                Ok(Woke::Notified | Woke::Timeout) => {}
+                // PgListener reconnected by itself; notifications may have
+                // been lost meanwhile, which the next drain covers.
+                Ok(Woke::Reconnected) => {
+                    Counters::add(&counters.listener_reconnects, 1);
+                    tracing::debug!("pg-bus: listener reconnected");
+                }
                 Err(e) => {
                     tracing::warn!("pg-bus: listener connection lost: {e}");
                     break;
@@ -122,40 +129,70 @@ async fn connect(pool: &PgPool, schema: &str) -> Result<PgListener, sqlx::Error>
 async fn drain(
     pool: &PgPool,
     schema: &str,
-    feed: &broadcast::Sender<Arc<Message>>,
-    recent: &Mutex<Recent>,
+    shared: &Shared,
     cursor: &mut Position,
 ) -> Result<(), crate::Error> {
+    let counters = &shared.counters;
     loop {
         let batch = backlog_on(pool, schema, *cursor, None, BATCH).await?;
+        Counters::add(&counters.listener_queries, 1);
         let full = batch.len() as i64 == BATCH;
+        if !batch.is_empty() {
+            tracing::debug!("pg-bus: listener read {} message(s)", batch.len());
+        }
+        Counters::add(&counters.delivered, batch.len() as u64);
         for message in batch {
             *cursor = message.position;
             let message = Arc::new(message);
-            recent
+            shared
+                .recent
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(message.clone());
             // No receivers is fine: nobody is subscribed in this process.
-            let _ = feed.send(message);
+            let _ = shared.feed.send(message);
         }
+        *counters
+            .listener_position
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(*cursor);
         if !full {
             return Ok(());
         }
     }
 }
 
-/// Waits for a notification or `delay`, whichever comes first. A
-/// reconnect (PgListener does it itself) wakes it too, since
-/// notifications may have been lost meanwhile.
-async fn next_notification(listener: &mut PgListener, delay: Duration) -> Result<(), sqlx::Error> {
+/// Why the listener woke.
+enum Woke {
+    Notified,
+    Timeout,
+    Reconnected,
+}
+
+/// Waits for a notification or `delay`, whichever comes first.
+async fn next_notification(
+    listener: &mut PgListener,
+    delay: Duration,
+) -> Result<Woke, sqlx::Error> {
     tokio::select! {
-        received = listener.try_recv() => received.map(|_| ())?,
-        _ = tokio::time::sleep(delay) => return Ok(()),
+        received = listener.try_recv() => {
+            if received?.is_none() {
+                return Ok(Woke::Reconnected);
+            }
+        }
+        _ = tokio::time::sleep(delay) => return Ok(Woke::Timeout),
     }
-    // One read of the backlog answers every notification already here:
-    // without this, a burst of N commits costs N rounds of queries long
-    // after it ends.
-    while listener.next_buffered().is_some() {}
-    Ok(())
+    // One read of the backlog answers every notification already here, so
+    // take them all, buffered or still unread on the socket (a zero timeout
+    // polls once; try_recv is cancel-safe). Without this, a burst of N
+    // commits costs N rounds of queries long after it ends.
+    loop {
+        while listener.next_buffered().is_some() {}
+        match tokio::time::timeout(Duration::ZERO, listener.try_recv()).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) => return Ok(Woke::Reconnected),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(Woke::Notified),
+        }
+    }
 }

@@ -1,6 +1,6 @@
 //! Rough numbers for pg-bus against a local PostgreSQL: publish
 //! throughput, delivery latency, fan-out to many subscribers in one
-//! process, and what the listener costs the database. Prints a markdown
+//! process, and the listener's own queries. Prints a markdown
 //! report (BENCH.md keeps the runs).
 //!
 //!     DATABASE_URL=... cargo run --release --example bench
@@ -214,39 +214,22 @@ async fn fanout(
     ))
 }
 
-/// Phase 4: transactions per second in the whole database, idle and under
-/// load, less the publishers' own.
+/// Phase 4: the listener's own queries per second (Bus::stats), idle and
+/// with messages arriving every 10 ms.
 async fn listener_cost(
     bus: &Bus,
     pool: &PgPool,
     s: &Scale,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    async fn commits(pool: &PgPool) -> Result<i64, sqlx::Error> {
-        // The statistics view lags by a moment; take a fresh snapshot.
-        sqlx::query("SELECT pg_stat_clear_snapshot()")
-            .execute(pool)
-            .await?;
-        sqlx::query_scalar(
-            "SELECT (xact_commit + xact_rollback)::bigint FROM pg_stat_database WHERE datname = current_database()",
-        )
-        .fetch_one(pool)
-        .await
-    }
     let window = Duration::from_secs(s.seconds * 2);
     let mut rows = Vec::new();
 
-    // Backends report their transaction counts lazily, an idle one up to
-    // about 10 s late (PostgreSQL 15+): let the earlier phases settle, or
-    // their counts land in this window.
-    tokio::time::sleep(Duration::from_secs(12)).await;
-    let before = commits(pool).await?;
+    let before = bus.stats().listener_queries;
     tokio::time::sleep(window).await;
-    let idle = (commits(pool).await? - before) as f64 / window.as_secs_f64();
-    rows.push(format!(
-        "| whole database, idle (includes autovacuum) | transactions/s | {idle:.1} |"
-    ));
+    let idle = (bus.stats().listener_queries - before) as f64 / window.as_secs_f64();
+    rows.push(format!("| listener, idle | queries/s | {idle:.2} |"));
 
-    let before = commits(pool).await?;
+    let before = bus.stats().listener_queries;
     let started = Instant::now();
     let mut published = 0u64;
     let mut tick = tokio::time::interval(Duration::from_millis(10));
@@ -255,12 +238,12 @@ async fn listener_cost(
         publish_one(bus, pool, "/cost").await?;
         published += 1;
     }
-    // The same lag: wait for the window's own counts to arrive.
-    tokio::time::sleep(Duration::from_secs(12)).await;
-    let total = (commits(pool).await? - before) as f64;
-    let others = (total - published as f64) / started.elapsed().as_secs_f64();
+    let queries = bus.stats().listener_queries - before;
+    let seconds = started.elapsed().as_secs_f64();
     rows.push(format!(
-        "| whole database besides the publishes, 100 messages/s | transactions/s | {others:.1} |"
+        "| listener, 100 messages/s | queries/s, per message | {:.1}, {:.2} |",
+        queries as f64 / seconds,
+        queries as f64 / published as f64
     ));
     Ok(rows)
 }
