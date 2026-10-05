@@ -47,29 +47,55 @@ pub async fn start_bus(adjust: impl FnOnce(&mut Config)) -> (Bus, PgPool, String
     )
 }
 
-/// Drops the schemas of test processes that have exited (`t_<pid>_<n>`,
-/// the pid no longer running), one process at a time.
+/// Cleans up after test processes that have exited (their pid no longer
+/// running): their prepared transactions (`pg-bus-test-<pid>`), which
+/// outlive them holding locks, then their schemas (`t_<pid>_<n>`). One
+/// process at a time; a schema still locked is left for a later run
+/// rather than waited on.
 async fn drop_stale_schemas(pool: &PgPool) {
+    let gone = |pid: &str| !std::path::Path::new(&format!("/proc/{pid}")).exists();
     let mut conn = pool.acquire().await.unwrap();
     sqlx::query("SELECT pg_advisory_lock(hashtext('pg-bus test cleanup'))")
         .execute(&mut *conn)
         .await
         .unwrap();
+    let prepared: Vec<String> =
+        sqlx::query_scalar("SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'pg-bus-test-%'")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+    for gid in prepared {
+        if gone(gid.trim_start_matches("pg-bus-test-")) {
+            sqlx::query(&format!("ROLLBACK PREPARED '{gid}'"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+    }
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT nspname::text FROM pg_namespace WHERE nspname ~ '^t_[0-9]+_[0-9]+$'",
     )
     .fetch_all(&mut *conn)
     .await
     .unwrap();
+    sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     for name in names {
-        let pid = name.split('_').nth(1).unwrap_or_default();
-        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            sqlx::query(&format!("DROP SCHEMA IF EXISTS {name} CASCADE"))
+        if gone(name.split('_').nth(1).unwrap_or_default()) {
+            let dropped = sqlx::query(&format!("DROP SCHEMA IF EXISTS {name} CASCADE"))
                 .execute(&mut *conn)
-                .await
-                .unwrap();
+                .await;
+            if let Err(e) = dropped {
+                eprintln!("left {name} for later: {e}");
+            }
         }
     }
+    sqlx::query("RESET lock_timeout")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     sqlx::query("SELECT pg_advisory_unlock(hashtext('pg-bus test cleanup'))")
         .execute(&mut *conn)
         .await

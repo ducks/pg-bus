@@ -113,16 +113,18 @@ async fn a_forgotten_prepared_transaction_shows_up_as_the_blocker() {
     drop(conn);
     publish(&bus, &pool, "/a", json!("waiting"), None).await;
 
-    let health = bus.health().await.unwrap();
-    let found = health
-        .blockers
-        .iter()
-        .any(|b| b.prepared.as_deref() == Some(gid.as_str()) && b.pid.is_none());
-    // Clean up before asserting, so a failure leaves nothing behind.
+    let health = bus.health().await;
+    // Clean up before anything can fail: a prepared transaction outlives
+    // the test and holds its locks.
     sqlx::query(&format!("ROLLBACK PREPARED '{gid}'"))
         .execute(&pool)
         .await
         .unwrap();
+    let health = health.unwrap();
+    let found = health
+        .blockers
+        .iter()
+        .any(|b| b.prepared.as_deref() == Some(gid.as_str()) && b.pid.is_none());
     assert!(found, "{gid} not among {:?}", health.blockers);
     let report = pg_bus::stall_report(&health, Duration::ZERO).unwrap();
     assert!(

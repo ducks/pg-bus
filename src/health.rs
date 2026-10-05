@@ -72,6 +72,7 @@ pub(crate) async fn health_on(pool: &PgPool, schema: &str) -> Result<Health, Err
     if waiting == 0 {
         return Ok(health);
     }
+    // (No max(xid8): PostgreSQL 13 has no such aggregate.)
     // In-progress transaction ids older than the newest waiting message,
     // matched to their sessions and prepared transactions. pg_stat_activity
     // and pg_prepared_xacts show 32-bit ids, so the 64-bit ones compare by
@@ -79,8 +80,9 @@ pub(crate) async fn health_on(pool: &PgPool, schema: &str) -> Result<Health, Err
     let rows: Vec<BlockerRow> =
         sqlx::query_as(&format!(
             "WITH snap AS (SELECT pg_current_snapshot() AS s), \
-                  held AS (SELECT max(m.xid) AS newest FROM {schema}.messages m, snap \
-                           WHERE m.xid >= pg_snapshot_xmin(snap.s)), \
+                  held AS (SELECT m.xid AS newest FROM {schema}.messages m, snap \
+                           WHERE m.xid >= pg_snapshot_xmin(snap.s) \
+                           ORDER BY m.xid DESC LIMIT 1), \
                   running AS (SELECT x::text::numeric % 4294967296 AS low \
                               FROM snap, held, pg_snapshot_xip(snap.s) AS x WHERE x < held.newest) \
              SELECT a.pid, NULL::text, EXTRACT(EPOCH FROM now() - a.xact_start)::float8, a.state, a.query \
