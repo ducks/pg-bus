@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{bus_in_schema, bus_with, everyone, publish};
+use common::{bus_in_schema, bus_with, everyone, publish, start_bus};
 use pg_bus::{Bus, Item, Position};
 use serde_json::json;
 use sqlx::PgPool;
@@ -194,7 +194,12 @@ async fn every_subscriber_gets_exactly_the_committed_sequence() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let (bus, pool) = bus_with(8).await;
+    // A small ring, so catch-ups cross between memory and the table.
+    let (bus, pool, _) = start_bus(|c| {
+        c.capacity = 8;
+        c.recent = 64;
+    })
+    .await;
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let start = bus.now().await.unwrap();

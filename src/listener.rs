@@ -7,7 +7,7 @@
 //! horizon it looks again on a short backoff, and when idle it still looks
 //! every `idle_poll` in case a notification was missed.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -15,6 +15,7 @@ use sqlx::postgres::PgListener;
 use tokio::sync::broadcast;
 
 use crate::health::{health_on, stall_report};
+use crate::recent::Recent;
 use crate::{Config, Message, Position, backlog_on, pending_after};
 
 /// Messages read per query; a full batch is followed by another at once.
@@ -24,6 +25,7 @@ pub(crate) async fn run(
     pool: PgPool,
     config: Config,
     feed: broadcast::Sender<Arc<Message>>,
+    recent: Arc<Mutex<Recent>>,
     mut cursor: Position,
 ) {
     let mut retry = config.min_poll;
@@ -41,7 +43,7 @@ pub(crate) async fn run(
         let mut wait = config.min_poll;
         let mut stall = StallWatch::default();
         loop {
-            match drain(&pool, &config.schema, &feed, &mut cursor).await {
+            match drain(&pool, &config.schema, &feed, &recent, &mut cursor).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::warn!("pg-bus: listener could not read the backlog: {e}");
@@ -114,10 +116,14 @@ async fn connect(pool: &PgPool, schema: &str) -> Result<PgListener, sqlx::Error>
 }
 
 /// Sends every deliverable message after the cursor, moving it along.
+/// Each goes into the recent ring before the feed: a subscriber joins the
+/// feed before reading the ring, so it finds a message in one or the
+/// other.
 async fn drain(
     pool: &PgPool,
     schema: &str,
     feed: &broadcast::Sender<Arc<Message>>,
+    recent: &Mutex<Recent>,
     cursor: &mut Position,
 ) -> Result<(), crate::Error> {
     loop {
@@ -125,8 +131,13 @@ async fn drain(
         let full = batch.len() as i64 == BATCH;
         for message in batch {
             *cursor = message.position;
+            let message = Arc::new(message);
+            recent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(message.clone());
             // No receivers is fine: nobody is subscribed in this process.
-            let _ = feed.send(Arc::new(message));
+            let _ = feed.send(message);
         }
         if !full {
             return Ok(());
