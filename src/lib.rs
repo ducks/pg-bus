@@ -17,6 +17,7 @@
 
 mod health;
 mod listener;
+mod recent;
 mod schema;
 #[cfg(feature = "axum")]
 pub mod sse;
@@ -24,7 +25,7 @@ mod subscription;
 
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -141,6 +142,15 @@ pub struct Config {
     /// The listener logs a warning (at most once a minute) when a committed
     /// message has waited longer than this behind an open transaction.
     pub stall_warning: Duration,
+    /// Recent messages each process keeps in memory, so subscribers
+    /// resuming from a recent position catch up without a query.
+    pub recent: usize,
+    /// How old a message must be before [`Bus::trim`] may delete it: longer
+    /// than any listener could still be behind. A subscriber whose position
+    /// is within a process's recent ring is caught up from memory without a
+    /// gap check, which holds only if trim never deletes a message that
+    /// listener has not read yet.
+    pub trim_grace: Duration,
 }
 
 impl Default for Config {
@@ -152,6 +162,8 @@ impl Default for Config {
             max_poll: Duration::from_secs(1),
             idle_poll: Duration::from_secs(30),
             stall_warning: Duration::from_secs(30),
+            recent: 10_000,
+            trim_grace: Duration::from_secs(60),
         }
     }
 }
@@ -167,6 +179,7 @@ struct Inner {
     pool: PgPool,
     config: Config,
     feed: broadcast::Sender<Arc<Message>>,
+    recent: Arc<Mutex<recent::Recent>>,
     listener: tokio::task::JoinHandle<()>,
 }
 
@@ -202,10 +215,12 @@ impl Bus {
         schema::migrate(&pool, &config.schema).await?;
         let (feed, _) = broadcast::channel(config.capacity);
         let start = horizon_on(&pool).await?;
+        let recent = Arc::new(Mutex::new(recent::Recent::new(start, config.recent)));
         let listener = tokio::spawn(listener::run(
             pool.clone(),
             config.clone(),
             feed.clone(),
+            recent.clone(),
             start,
         ));
         Ok(Bus {
@@ -213,6 +228,7 @@ impl Bus {
                 pool,
                 config,
                 feed,
+                recent,
                 listener,
             }),
         })
@@ -298,7 +314,9 @@ impl Bus {
     }
 
     /// Deletes delivered messages older than `max_age`, and on each channel
-    /// all but the newest `keep_per_channel`. Returns how many went.
+    /// all but the newest `keep_per_channel`. Returns how many went. Never
+    /// deletes a message younger than [`Config::trim_grace`]: a listener may
+    /// not have read it yet, and its subscribers would miss it unawares.
     pub async fn trim(&self, max_age: Duration, keep_per_channel: i64) -> Result<u64, Error> {
         let schema = self.schema();
         let mut tx = self.inner.pool.begin().await?;
@@ -309,11 +327,13 @@ impl Bus {
                     FROM {schema}.messages) \
              DELETE FROM {schema}.messages m USING horizon, ranked r \
              WHERE r.id = m.id AND m.xid < horizon.xmin \
+               AND m.created_at < now() - make_interval(secs => $3) \
                AND (m.created_at < now() - make_interval(secs => $1) OR r.n > $2) \
              RETURNING m.xid::text, m.id"
         ))
         .bind(max_age.as_secs_f64())
         .bind(keep_per_channel)
+        .bind(self.inner.config.trim_grace.as_secs_f64())
         .fetch_all(&mut *tx)
         .await?;
         // The newest position trimmed: a cursor below it may have missed
@@ -348,6 +368,21 @@ impl Bus {
 
     pub(crate) fn feed(&self) -> broadcast::Receiver<Arc<Message>> {
         self.inner.feed.subscribe()
+    }
+
+    /// The recent messages after `after`, if this process still holds all
+    /// of them in memory.
+    pub(crate) fn recent_after(
+        &self,
+        after: Position,
+        filter: &Filter,
+        limit: usize,
+    ) -> Option<Vec<Message>> {
+        self.inner
+            .recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .after(after, filter, limit)
     }
 }
 

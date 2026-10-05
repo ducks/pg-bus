@@ -5,7 +5,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{bus, bus_with, everyone, publish, settled};
+use common::{bus, bus_with, everyone, publish, settled, start_bus};
 use pg_bus::{Filter, Item, Message, Position};
 use serde_json::{Value, json};
 
@@ -173,18 +173,20 @@ async fn a_subscriber_behind_the_feed_catches_up_from_the_backlog() {
     assert_eq!(got, (1..=10).map(|n| json!(n)).collect::<Vec<_>>());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn trimming_keeps_the_newest_and_reports_gaps() {
-    let (bus, pool) = bus().await;
-    let start = bus.now().await.unwrap();
+/// Publishes 1..=5 on /a and "b" on /b, waits until the listener has read
+/// them (as it has in practice by the time trim_grace has passed), and
+/// trims to two per channel.
+async fn publish_and_trim(bus: &pg_bus::Bus, pool: &sqlx::PgPool, start: Position) -> Vec<Message> {
+    let mut live = bus.subscribe(start, everyone(&["/a", "/b"]));
     for n in 1..=5 {
-        publish(&bus, &pool, "/a", json!(n), None).await;
+        publish(bus, pool, "/a", json!(n), None).await;
     }
-    publish(&bus, &pool, "/b", json!("b"), None).await;
-    let before = settled(&bus, start, &everyone(&["/a"]), 5).await;
-    settled(&bus, start, &everyone(&["/a", "/b"]), 6).await;
-
-    // Two per channel are kept.
+    publish(bus, pool, "/b", json!("b"), None).await;
+    let before = settled(bus, start, &everyone(&["/a"]), 5).await;
+    settled(bus, start, &everyone(&["/a", "/b"]), 6).await;
+    for _ in 0..6 {
+        next_message(&mut live).await;
+    }
     let deleted = bus.trim(Duration::from_secs(3600), 2).await.unwrap();
     assert_eq!(deleted, 3);
     let after = bus
@@ -192,6 +194,19 @@ async fn trimming_keeps_the_newest_and_reports_gaps() {
         .await
         .unwrap();
     assert_eq!(data(&after), vec![json!(4), json!(5), json!("b")]);
+    before
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trimming_keeps_the_newest_and_reports_gaps() {
+    // No ring: what the table no longer has, nothing has.
+    let (bus, pool, _) = start_bus(|c| {
+        c.recent = 0;
+        c.trim_grace = Duration::ZERO;
+    })
+    .await;
+    let start = bus.now().await.unwrap();
+    let before = publish_and_trim(&bus, &pool, start).await;
 
     // A cursor from before the trim has missed messages: it is told so
     // first, then gets what remains.
@@ -208,6 +223,36 @@ async fn trimming_keeps_the_newest_and_reports_gaps() {
     assert!(bus.trimmed_after(before[1].position).await.unwrap());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn messages_still_in_the_ring_are_delivered_after_a_trim() {
+    let (bus, pool, _) = start_bus(|c| {
+        c.recent = 100;
+        c.trim_grace = Duration::ZERO;
+    })
+    .await;
+    let start = bus.now().await.unwrap();
+    let before = publish_and_trim(&bus, &pool, start).await;
+    // A cursor from before the trim misses nothing: memory still has it.
+    let mut stale = bus.subscribe(start, everyone(&["/a"]));
+    let mut got = Vec::new();
+    for _ in 0..5 {
+        got.push(next_message(&mut stale).await.data);
+    }
+    assert_eq!(got, (1..=5).map(|n| json!(n)).collect::<Vec<_>>());
+    assert_eq!(before.len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trimming_spares_messages_younger_than_the_grace() {
+    let (bus, pool) = bus().await;
+    let start = bus.now().await.unwrap();
+    for n in 1..=5 {
+        publish(&bus, &pool, "/a", json!(n), None).await;
+    }
+    settled(&bus, start, &everyone(&["/a"]), 5).await;
+    // Keep one per channel, but every message is seconds old.
+    assert_eq!(bus.trim(Duration::ZERO, 1).await.unwrap(), 0);
+}
 #[test]
 fn positions_round_trip_as_strings() {
     let p: Position = "742-15".parse().unwrap();

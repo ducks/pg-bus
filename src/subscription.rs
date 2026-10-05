@@ -64,7 +64,13 @@ impl Subscription {
     /// picks up where this one was.
     pub async fn next(&mut self) -> Result<Item, Error> {
         if !self.gap_checked {
-            let trimmed = self.bus.trimmed_after(self.position).await?;
+            // Held in memory from here on: nothing after it was trimmed
+            // away, and no query is needed to say so.
+            let in_memory = self
+                .bus
+                .recent_after(self.position, &self.filter, 0)
+                .is_some();
+            let trimmed = !in_memory && self.bus.trimmed_after(self.position).await?;
             self.gap_checked = true;
             if trimmed {
                 return Ok(Item::Gap);
@@ -91,7 +97,15 @@ impl Subscription {
                 return Ok(Item::Message(message));
             }
             if self.catching_up {
-                let batch = self.bus.backlog(self.position, &self.filter, BATCH).await?;
+                // From memory when this process still holds everything after
+                // the position, else from the backlog table.
+                let batch = match self
+                    .bus
+                    .recent_after(self.position, &self.filter, BATCH as usize)
+                {
+                    Some(batch) => batch,
+                    None => self.bus.backlog(self.position, &self.filter, BATCH).await?,
+                };
                 if (batch.len() as i64) < BATCH {
                     self.catching_up = false;
                 }

@@ -18,6 +18,11 @@ pub async fn bus_with(capacity: usize) -> (Bus, PgPool) {
 
 /// A bus, its pool and the schema it runs in.
 pub async fn bus_in_schema(capacity: usize) -> (Bus, PgPool, String) {
+    start_bus(|c| c.capacity = capacity).await
+}
+
+/// A bus with its config adjusted, its pool and its schema.
+pub async fn start_bus(adjust: impl FnOnce(&mut Config)) -> (Bus, PgPool, String) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run inside nix-shell)");
     let pool = PgPool::connect(&url).await.unwrap();
     drop_stale_schemas(&pool).await;
@@ -30,11 +35,11 @@ pub async fn bus_in_schema(capacity: usize) -> (Bus, PgPool, String) {
         .execute(&pool)
         .await
         .unwrap();
-    let config = Config {
+    let mut config = Config {
         schema: schema.clone(),
-        capacity,
         ..Config::default()
     };
+    adjust(&mut config);
     (
         Bus::start(pool.clone(), config).await.unwrap(),
         pool,
