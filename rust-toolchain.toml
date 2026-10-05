@@ -1,0 +1,6 @@
+# The one place the Rust version is set: shell.nix builds it with
+# oxalica/rust-overlay, CI and the release workflow read it.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

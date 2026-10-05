@@ -1,0 +1,11 @@
+[package]
+name = "pg-bus"
+version = "20261005.0.0"
+edition = "2024"
+description = "A message bus on PostgreSQL: publish inside your transaction, resume from a cursor, deliver over SSE."
+license = "MIT"
+repository = "https://github.com/ducks/pg-bus"
+keywords = ["postgres", "pubsub", "sse", "messagebus", "outbox"]
+categories = ["database", "web-programming"]
+
+[dependencies]
