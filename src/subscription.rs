@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::stats::Counters;
 use crate::{Bus, Error, Filter, Message, Position};
 
 /// Messages read from the backlog per query.
@@ -86,6 +87,7 @@ impl Subscription {
                         "pg-bus: {} delivered after {} ({})",
                         message.position, self.position, message.channel
                     );
+                    Counters::add(&self.bus.counters().out_of_order, 1);
                     tracing::error!(
                         "pg-bus: skipped {} after {}: out of order",
                         message.position,
@@ -103,8 +105,20 @@ impl Subscription {
                     .bus
                     .recent_after(self.position, &self.filter, BATCH as usize)
                 {
-                    Some(batch) => batch,
-                    None => self.bus.backlog(self.position, &self.filter, BATCH).await?,
+                    Some(batch) => {
+                        Counters::add(&self.bus.counters().catch_ups_from_memory, 1);
+                        batch
+                    }
+                    None => {
+                        let batch = self.bus.backlog(self.position, &self.filter, BATCH).await?;
+                        Counters::add(&self.bus.counters().catch_ups_from_database, 1);
+                        tracing::debug!(
+                            "pg-bus: caught up {} message(s) from the backlog table after {}",
+                            batch.len(),
+                            self.position
+                        );
+                        batch
+                    }
                 };
                 if (batch.len() as i64) < BATCH {
                     self.catching_up = false;
@@ -125,7 +139,11 @@ impl Subscription {
                 }
                 // Fell behind the feed: the backlog has everything after
                 // the position.
-                Err(RecvError::Lagged(_)) => self.catching_up = true,
+                Err(RecvError::Lagged(n)) => {
+                    Counters::add(&self.bus.counters().lagged, 1);
+                    tracing::debug!("pg-bus: subscriber fell {n} message(s) behind the feed");
+                    self.catching_up = true;
+                }
                 Err(RecvError::Closed) => return Err(Error::Closed),
             }
         }

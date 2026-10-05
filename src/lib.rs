@@ -21,6 +21,7 @@ mod recent;
 mod schema;
 #[cfg(feature = "axum")]
 pub mod sse;
+mod stats;
 mod subscription;
 mod trim;
 
@@ -34,6 +35,7 @@ use sqlx::{PgConnection, PgPool};
 use tokio::sync::broadcast;
 
 pub use health::{Blocker, Health, stall_report};
+pub use stats::Stats;
 pub use subscription::{Item, Subscription};
 pub use trim::Trim;
 
@@ -184,10 +186,19 @@ pub struct Bus {
 struct Inner {
     pool: PgPool,
     config: Config,
-    feed: broadcast::Sender<Arc<Message>>,
-    recent: Arc<Mutex<recent::Recent>>,
+    shared: Arc<Shared>,
+    /// Where the listener started, for stats before it reads anything.
+    start: Position,
     listener: tokio::task::JoinHandle<()>,
     trimmer: tokio::task::JoinHandle<()>,
+}
+
+/// What the listener and the subscriptions in one process share: the live
+/// feed, the recent ring and the counters.
+pub(crate) struct Shared {
+    pub(crate) feed: broadcast::Sender<Arc<Message>>,
+    pub(crate) recent: Mutex<recent::Recent>,
+    pub(crate) counters: stats::Counters,
 }
 
 impl Drop for Inner {
@@ -223,12 +234,15 @@ impl Bus {
         schema::migrate(&pool, &config.schema).await?;
         let (feed, _) = broadcast::channel(config.capacity);
         let start = horizon_on(&pool).await?;
-        let recent = Arc::new(Mutex::new(recent::Recent::new(start, config.recent)));
+        let shared = Arc::new(Shared {
+            feed,
+            recent: Mutex::new(recent::Recent::new(start, config.recent)),
+            counters: stats::Counters::default(),
+        });
         let listener = tokio::spawn(listener::run(
             pool.clone(),
             config.clone(),
-            feed.clone(),
-            recent.clone(),
+            shared.clone(),
             start,
         ));
         let trimmer = tokio::spawn(trim::run(pool.clone(), config.clone()));
@@ -236,8 +250,8 @@ impl Bus {
             inner: Arc::new(Inner {
                 pool,
                 config,
-                feed,
-                recent,
+                shared,
+                start,
                 listener,
                 trimmer,
             }),
@@ -349,8 +363,20 @@ impl Bus {
         Subscription::new(self.clone(), from, filter)
     }
 
+    /// This process's counters (see [`Stats`]).
+    pub fn stats(&self) -> Stats {
+        let shared = &self.inner.shared;
+        shared
+            .counters
+            .snapshot(shared.feed.receiver_count(), self.inner.start)
+    }
+
     pub(crate) fn feed(&self) -> broadcast::Receiver<Arc<Message>> {
-        self.inner.feed.subscribe()
+        self.inner.shared.feed.subscribe()
+    }
+
+    pub(crate) fn counters(&self) -> &stats::Counters {
+        &self.inner.shared.counters
     }
 
     /// The recent messages after `after`, if this process still holds all
@@ -362,6 +388,7 @@ impl Bus {
         limit: usize,
     ) -> Option<Vec<Message>> {
         self.inner
+            .shared
             .recent
             .lock()
             .unwrap_or_else(|e| e.into_inner())

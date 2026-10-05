@@ -19,7 +19,7 @@ fn the_bench_runs_quick() {
         "| publish,",
         "| latency,",
         "| fan-out, 10 subscribers",
-        "| whole database",
+        "| listener, idle",
     ] {
         assert!(stdout.contains(row), "{row} missing:\n{stdout}");
     }
