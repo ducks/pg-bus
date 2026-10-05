@@ -58,10 +58,15 @@ impl Subscription {
     }
 
     /// The next item, waiting for one if none is due.
+    ///
+    /// Cancel-safe: state only changes after each await completes, so
+    /// dropping the future (a timeout) loses nothing and the next call
+    /// picks up where this one was.
     pub async fn next(&mut self) -> Result<Item, Error> {
         if !self.gap_checked {
+            let trimmed = self.bus.trimmed_after(self.position).await?;
             self.gap_checked = true;
-            if self.bus.trimmed_after(self.position).await? {
+            if trimmed {
                 return Ok(Item::Gap);
             }
         }

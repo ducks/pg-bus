@@ -16,6 +16,42 @@ and per-message audiences, without Redis.
 
 Status: in development.
 
+## Use
+
+```rust
+use pg_bus::{Bus, Config, Filter};
+
+let bus = Bus::start(pool.clone(), Config::default()).await?;
+
+// Publishing: inside the transaction that makes the change.
+let mut tx = pool.begin().await?;
+// ... insert the post ...
+bus.publish(&mut tx, "/topic/35", &json!({"post_id": 52}), None).await?;
+let audience = ["user:3".to_string()];
+bus.publish(&mut tx, "/notification/3", &json!({"unread": 4}), Some(&audience)).await?;
+tx.commit().await?; // delivered from here; a rollback delivers nothing
+
+// Rendering a page: hand the client the position to start from.
+let since = bus.now().await?;
+
+// Subscribing: the application decides channels and tags.
+let filter = Filter {
+    channels: vec!["/topic/35".into(), "/notification/3".into()],
+    tags: vec!["user:3".into(), "group:10".into()],
+};
+let mut sub = bus.subscribe(since, filter);
+while let Ok(item) = sub.next().await { /* Item::Message or Item::Gap */ }
+```
+
+With the `axum` feature, `pg_bus::sse` turns a subscription into a
+server-sent events response (`events`, ids are positions, so a browser's
+`EventSource` resumes by itself), reads `Last-Event-ID`
+(`last_event_id`), and answers long polls (`poll`).
+
+Ordering: a message is delivered once every older write transaction has
+ended, so a cursor never skips one that commits late. A long-running write
+transaction anywhere in the database delays delivery until it ends.
+
 ## Development
 
 ```bash

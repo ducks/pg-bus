@@ -63,7 +63,7 @@ release: version-bump
 # Tests run against the shell's PostgreSQL (DATABASE_URL, set by shell.nix);
 # start it with db_start.
 test:
-	cargo nextest run
+	cargo nextest run --all-features
 
 # Run clippy with warnings-as-errors (mirrors CI)
 clippy:

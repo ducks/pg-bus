@@ -1,69 +1,13 @@
 //! Against the shell's PostgreSQL (`DATABASE_URL`, `db_start`). Each test
 //! runs in a schema of its own.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+mod common;
+
 use std::time::Duration;
 
-use pg_bus::{Bus, Config, Filter, Item, Message, Position};
+use common::{bus, bus_with, everyone, publish, settled};
+use pg_bus::{Filter, Item, Message, Position};
 use serde_json::{Value, json};
-use sqlx::PgPool;
-
-static NEXT: AtomicU32 = AtomicU32::new(0);
-
-async fn bus_with(capacity: usize) -> (Bus, PgPool) {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run inside nix-shell)");
-    let pool = PgPool::connect(&url).await.unwrap();
-    let schema = format!(
-        "t_{}_{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::SeqCst)
-    );
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    let config = Config {
-        schema,
-        capacity,
-        ..Config::default()
-    };
-    (Bus::start(pool.clone(), config).await.unwrap(), pool)
-}
-
-async fn bus() -> (Bus, PgPool) {
-    bus_with(1024).await
-}
-
-fn everyone(channels: &[&str]) -> Filter {
-    Filter {
-        channels: channels.iter().map(|c| c.to_string()).collect(),
-        tags: Vec::new(),
-    }
-}
-
-/// Publishes one message in a transaction of its own and commits it.
-async fn publish(bus: &Bus, pool: &PgPool, channel: &str, data: Value, audience: Option<&[&str]>) {
-    let audience: Option<Vec<String>> = audience.map(|a| a.iter().map(|s| s.to_string()).collect());
-    let mut tx = pool.begin().await.unwrap();
-    bus.publish(&mut tx, channel, &data, audience.as_deref())
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-}
-
-/// The backlog once `n` messages are deliverable. A committed message
-/// waits while any older write transaction is open, and tests running
-/// alongside hold some open on purpose.
-async fn settled(bus: &Bus, from: Position, filter: &Filter, n: usize) -> Vec<Message> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let messages = bus.backlog(from, filter, 100).await.unwrap();
-        if messages.len() >= n || tokio::time::Instant::now() > deadline {
-            return messages;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
 
 fn data(messages: &[Message]) -> Vec<Value> {
     messages.iter().map(|m| m.data.clone()).collect()
@@ -272,4 +216,67 @@ fn positions_round_trip_as_strings() {
         assert!(bad.parse::<Position>().is_err(), "{bad}");
     }
     assert!(Position::START < p);
+}
+
+/// Publishers committing out of order, subscribers lagging behind a tiny
+/// feed: every subscriber gets every message once, in position order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_publishers_and_lagging_subscribers_lose_nothing() {
+    const PUBLISHERS: usize = 4;
+    const EACH: usize = 25;
+    let (bus, pool) = bus_with(4).await;
+    let start = bus.now().await.unwrap();
+    let subscribers: Vec<_> = (0..3)
+        .map(|n| {
+            let mut sub = bus.subscribe(start, everyone(&["/a"]));
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                while got.len() < PUBLISHERS * EACH {
+                    let m = next_message(&mut sub).await;
+                    // Slow readers fall behind the feed's capacity.
+                    if n > 0 {
+                        tokio::time::sleep(Duration::from_millis(2 * n as u64)).await;
+                    }
+                    got.push(m);
+                }
+                got
+            })
+        })
+        .collect();
+    let publishers: Vec<_> = (0..PUBLISHERS)
+        .map(|p| {
+            let (bus, pool) = (bus.clone(), pool.clone());
+            tokio::spawn(async move {
+                for i in 0..EACH {
+                    let mut tx = pool.begin().await.unwrap();
+                    bus.publish(&mut tx, "/a", &json!([p, i]), None)
+                        .await
+                        .unwrap();
+                    // Hold some transactions open so others commit first.
+                    if (p + i) % 3 == 0 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    tx.commit().await.unwrap();
+                }
+            })
+        })
+        .collect();
+    for p in publishers {
+        p.await.unwrap();
+    }
+    for s in subscribers {
+        let got = s.await.unwrap();
+        let positions: Vec<Position> = got.iter().map(|m| m.position).collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "out of order: {:?}",
+            got.iter()
+                .map(|m| (m.position.to_string(), m.data.clone()))
+                .collect::<Vec<_>>()
+        );
+        let mut seen: Vec<Value> = got.iter().map(|m| m.data.clone()).collect();
+        seen.sort_by_key(|v| v.to_string());
+        seen.dedup();
+        assert_eq!(seen.len(), PUBLISHERS * EACH);
+    }
 }
