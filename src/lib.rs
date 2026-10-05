@@ -17,6 +17,8 @@
 
 mod listener;
 mod schema;
+#[cfg(feature = "axum")]
+pub mod sse;
 mod subscription;
 
 use std::fmt;
