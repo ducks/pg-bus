@@ -1,0 +1,70 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# `make lint` locally is these two jobs in a row.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml sets the version for rustup here and for
+      # shell.nix locally, so clippy agrees in both places.
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format, clippy and docs
+        run: make fmt-check clippy doc
+
+  # The oldest supported PostgreSQL and the two newest, each with two-phase
+  # commit on so the prepared-transaction stall test runs.
+  test:
+    name: test (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["13", "16", "17"]
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pg_bus_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A service container cannot take server flags; docker run can.
+      - name: Start PostgreSQL ${{ matrix.postgres }}
+        run: |
+          docker run -d --name postgres -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=pg_bus_test \
+            postgres:${{ matrix.postgres }} -c max_prepared_transactions=10
+          for _ in $(seq 1 30); do
+            docker exec postgres pg_isready -U postgres -d pg_bus_test && break
+            sleep 1
+          done
+
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ matrix.postgres == '16' }}
+
+      # The same nextest as shell.nix carries.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.95
+
+      - name: Test
+        run: make test
