@@ -1,7 +1,40 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 //! pg-bus: a message bus on PostgreSQL.
 //!
 //! Messages are published inside the caller's transaction, kept in a
 //! backlog table, and delivered to subscribers that resume from a cursor.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use pg_bus::{Bus, Config, Filter, Item};
+//! use serde_json::json;
+//!
+//! # async fn example(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+//! let bus = Bus::start(pool.clone(), Config::default()).await?;
+//!
+//! // Publish inside the transaction that makes the change: delivered once
+//! // it commits, never if it rolls back.
+//! let mut tx = pool.begin().await?;
+//! bus.publish(&mut tx, "/topic/35", &json!({ "post_id": 52 }), None).await?;
+//! tx.commit().await?;
+//!
+//! // Subscribe from a position (here, from now on) to some channels, with
+//! // the tags this subscriber holds.
+//! let filter = Filter {
+//!     channels: vec!["/topic/35".into()],
+//!     tags: vec!["user:3".into()],
+//! };
+//! let mut subscription = bus.subscribe(bus.now().await?, filter);
+//! while let Ok(item) = subscription.next().await {
+//!     match item {
+//!         Item::Message(m) => println!("{} {} {}", m.position, m.channel, m.data),
+//!         Item::Gap => println!("missed some: reload"),
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Ordering
 //!
@@ -52,6 +85,7 @@ mod listener;
 mod recent;
 mod schema;
 #[cfg(feature = "axum")]
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
 pub mod sse;
 mod stats;
 mod subscription;
@@ -160,7 +194,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Db(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {

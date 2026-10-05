@@ -14,7 +14,18 @@ and per-message audiences, without Redis.
 - **SSE first.** Delivered as server-sent events with `Last-Event-ID`,
   with a long-poll fallback.
 
-Status: in development.
+## Install
+
+```toml
+[dependencies]
+pg-bus = "20261005"
+# with server-sent events and long polls for axum:
+pg-bus = { version = "20261005", features = ["axum"] }
+```
+
+Versions are dates (YYYYMMDD.0.N); each release is a new major version.
+Needs PostgreSQL 13 or newer and Rust 1.88 or newer. The bus creates its
+schema (`pg_bus` by default) on start.
 
 ## Use
 
