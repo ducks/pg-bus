@@ -14,7 +14,7 @@ use axum::response::Response;
 use axum::routing::get;
 use common::{bus, everyone, publish, settled};
 use http_body_util::BodyExt;
-use pg_bus::sse::{events, last_event_id, poll};
+use pg_bus::sse::{Options, events, last_event_id, poll};
 use pg_bus::{Bus, Position};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,6 +23,8 @@ use tower::ServiceExt;
 #[derive(Deserialize)]
 struct Since {
     since: Option<String>,
+    /// The stream's max_lifetime, for the tests that end one.
+    lifetime_ms: Option<u64>,
 }
 
 /// The resume position: Last-Event-ID on a reconnect, else the position
@@ -41,10 +43,12 @@ fn app(bus: Bus) -> Router {
             get(
                 |State(bus): State<Bus>, headers: HeaderMap, Query(q): Query<Since>| async move {
                     let from = from(&bus, &headers, q.since).await;
-                    events(
-                        bus.subscribe(from, everyone(&["/chat"])),
-                        Duration::from_millis(200),
-                    )
+                    let options = Options {
+                        heartbeat: Duration::from_millis(200),
+                        max_lifetime: q.lifetime_ms.map(Duration::from_millis),
+                        retry: Some(Duration::from_millis(1500)),
+                    };
+                    events(bus.subscribe(from, everyone(&["/chat"])), options)
                 },
             ),
         )
@@ -146,9 +150,9 @@ async fn a_reconnect_with_last_event_id_gets_what_it_missed() {
 async fn idle_streams_send_heartbeats() {
     let (bus, _pool) = bus().await;
     let mut response = get_response(&bus, "/events", &[]).await;
-    // axum's keep-alive is an empty comment line.
-    let text = read_until(&mut response, ":").await;
-    assert!(text.starts_with(':'), "{text:?}");
+    // After the retry, axum's keep-alive: an empty comment line.
+    let text = read_until(&mut response, "\n\n:").await;
+    assert!(text.starts_with("retry: 1500\n\n:"), "{text:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -200,4 +204,53 @@ fn last_event_id_ignores_missing_and_malformed_headers() {
     assert_eq!(last_event_id(&headers), None);
     headers.insert("last-event-id", "7-3".parse().unwrap());
     assert_eq!(last_event_id(&headers), Some("7-3".parse().unwrap()));
+}
+
+/// Reads the stream until it ends (or 10 s pass); the text it carried.
+async fn read_to_end(response: &mut Response) -> String {
+    let mut text = String::new();
+    let body = response.body_mut();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, body.frame())
+            .await
+            .unwrap_or_else(|_| panic!("still open after 10 s: {text:?}"))
+        {
+            None => return text,
+            Some(frame) => {
+                if let Ok(data) = frame.unwrap().into_data() {
+                    text.push_str(std::str::from_utf8(&data).unwrap());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_say_how_soon_to_reconnect_first() {
+    let (bus, _pool) = bus().await;
+    let mut response = get_response(&bus, "/events", &[]).await;
+    let text = read_until(&mut response, "\n\n").await;
+    assert!(text.starts_with("retry: 1500\n"), "{text:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_end_after_their_lifetime_and_resume_without_loss() {
+    let (bus, pool) = bus().await;
+    let started = tokio::time::Instant::now();
+    let mut response = get_response(&bus, "/events?lifetime_ms=400", &[]).await;
+    publish(&bus, &pool, "/chat", json!("before"), None).await;
+    let text = read_to_end(&mut response).await;
+    let lived = started.elapsed();
+    // 400 ms, within 10% either way (plus the time to answer).
+    assert!(lived >= Duration::from_millis(360), "{lived:?}");
+    assert!(lived < Duration::from_secs(3), "{lived:?}");
+    let (id, data) = first_message(&text);
+    assert_eq!(data["data"], json!("before"));
+
+    // Published while disconnected: the reconnect gets it.
+    publish(&bus, &pool, "/chat", json!("between"), None).await;
+    let mut again = get_response(&bus, "/events", &[("last-event-id", &id)]).await;
+    let text = read_until(&mut again, "event: message").await;
+    assert_eq!(first_message(&text).1["data"], json!("between"));
 }
