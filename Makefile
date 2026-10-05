@@ -1,4 +1,4 @@
-.PHONY: help version-bump release test clean clippy fmt fmt-check doc lint install-hooks
+.PHONY: help version-bump release test publish-check clean clippy fmt fmt-check doc lint install-hooks
 
 # Auto-generate version from today's date with auto-incrementing patch
 # Format: YYYYMMDD.0.X where X increments if releasing multiple times per day
@@ -21,12 +21,13 @@ help:
 	@echo "pg-bus Makefile"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make release                       - Auto-version and release (recommended)"
+	@echo "  make release                       - Auto-version and release to GitHub and crates.io (recommended)"
 	@echo "  make release VERSION=20261005.0.0  - Release with specific version"
 	@echo "  make test                          - Run tests (db_start first)"
 	@echo "  make clippy                        - Run clippy"
 	@echo "  make fmt / fmt-check               - Format / check formatting"
 	@echo "  make doc                           - Build the docs, warnings as errors"
+	@echo "  make publish-check                 - Package and build it as crates.io would"
 	@echo "  make lint                          - All CI checks (fmt-check, clippy, tests)"
 	@echo "  make install-hooks                 - Install a pre-push hook running 'make lint'"
 	@echo "  make clean                         - Clean build artifacts"
@@ -43,12 +44,11 @@ version-bump:
 	@echo "Updating Cargo.lock..."
 	@cargo check --quiet 2>/dev/null || true
 	@git add Cargo.toml Cargo.lock
-	@git commit -m "chore: bump version to $(VERSION)"
+	@git diff --staged --quiet || git commit -m "chore: bump version to $(VERSION)"
 	@echo ""
 	@echo "Created branch release/v$(VERSION)"
 
-# Merge to main, tag, push. No cargo publish yet: add it here once the
-# crate is ready for crates.io.
+# Merge to main, tag, push, and publish to crates.io.
 release: version-bump
 	@echo "Merging into main..."
 	@git checkout main
@@ -58,6 +58,8 @@ release: version-bump
 	@echo "Pushing to origin..."
 	@git push origin main
 	@git push origin v$(VERSION)
+	@echo "Publishing to crates.io..."
+	@cargo publish
 	@echo ""
 	@echo "Released v$(VERSION)"
 
@@ -65,6 +67,11 @@ release: version-bump
 # start it with db_start.
 test:
 	cargo nextest run --all-features
+	cargo test --doc --all-features
+
+# What crates.io would get, built from the packaged files alone.
+publish-check:
+	cargo publish --dry-run --allow-dirty
 
 # Run clippy with warnings-as-errors (mirrors CI)
 clippy:

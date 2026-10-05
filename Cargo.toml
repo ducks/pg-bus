@@ -7,6 +7,16 @@ license = "MIT"
 repository = "https://github.com/ducks/pg-bus"
 keywords = ["postgres", "pubsub", "sse", "messagebus", "outbox"]
 categories = ["database", "web-programming"]
+readme = "README.md"
+documentation = "https://docs.rs/pg-bus"
+# if-let chains.
+rust-version = "1.88"
+# The library and what explains it; the tests and the bench need a database.
+include = ["src/**", "README.md", "LICENSE", "BENCH.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "json", "macros"] }

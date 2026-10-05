@@ -25,6 +25,19 @@ jobs:
       - name: Format, clippy and docs
         run: make fmt-check clippy doc
 
+  # rust-version in Cargo.toml: the library builds with it.
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88 --profile minimal
+
+      - name: Build the library with 1.88
+        run: cargo +1.88 check --lib --all-features
+
   # The oldest supported PostgreSQL and the two newest, each with two-phase
   # commit on so the prepared-transaction stall test runs.
   test:
