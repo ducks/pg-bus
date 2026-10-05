@@ -46,7 +46,9 @@ while let Ok(item) = sub.next().await { /* Item::Message or Item::Gap */ }
 With the `axum` feature, `pg_bus::sse` turns a subscription into a
 server-sent events response (`events`, ids are positions, so a browser's
 `EventSource` resumes by itself), reads `Last-Event-ID`
-(`last_event_id`), and answers long polls (`poll`).
+(`last_event_id`), and answers long polls (`poll`). Streams end after
+`Options::max_lifetime` (10 minutes by default, jittered), so a reconnect
+re-runs the application's access checks.
 
 Ordering: a message is delivered once every older write transaction has
 ended, so a cursor never skips one that commits late. A long-running write
