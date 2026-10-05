@@ -150,7 +150,12 @@ async fn drain(
 /// notifications may have been lost meanwhile.
 async fn next_notification(listener: &mut PgListener, delay: Duration) -> Result<(), sqlx::Error> {
     tokio::select! {
-        received = listener.try_recv() => received.map(|_| ()),
-        _ = tokio::time::sleep(delay) => Ok(()),
+        received = listener.try_recv() => received.map(|_| ())?,
+        _ = tokio::time::sleep(delay) => return Ok(()),
     }
+    // One read of the backlog answers every notification already here:
+    // without this, a burst of N commits costs N rounds of queries long
+    // after it ends.
+    while listener.next_buffered().is_some() {}
+    Ok(())
 }
