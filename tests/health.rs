@@ -5,7 +5,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{bus, publish};
+use common::{bus, bus_in_schema, publish};
 use pg_bus::{Bus, Health};
 use serde_json::json;
 
@@ -72,25 +72,38 @@ async fn an_open_transaction_shows_up_as_the_blocker() {
     assert_eq!(health, Health::default());
 }
 
-/// A prepared transaction belongs to no session and only ends with COMMIT
-/// or ROLLBACK PREPARED: forgotten, it holds delivery back for good.
-/// Needs max_prepared_transactions > 0 (nix/postgres.nix sets it; restart
-/// with db_stop and db_start after changing it).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_forgotten_prepared_transaction_shows_up_as_the_blocker() {
-    let (bus, pool) = bus().await;
+/// Two-phase commit, for the tests that need it: on when
+/// max_prepared_transactions > 0 (nix/postgres.nix sets it; restart with
+/// db_stop and db_start after changing it).
+async fn prepared_transactions_on(pool: &sqlx::PgPool) -> bool {
     let max: String = sqlx::query_scalar("SHOW max_prepared_transactions")
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
     if max == "0" {
         eprintln!("not run: max_prepared_transactions is 0 (restart the shell's PostgreSQL)");
+    }
+    max != "0"
+}
+
+/// A prepared transaction belongs to no session and only ends with COMMIT
+/// or ROLLBACK PREPARED: forgotten, it holds delivery back for good. Here
+/// it is some other work's, writing to a table of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forgotten_prepared_transaction_shows_up_as_the_blocker() {
+    let (bus, pool, schema) = bus_in_schema(1024).await;
+    if !prepared_transactions_on(&pool).await {
         return;
     }
+    sqlx::query(&format!("CREATE TABLE {schema}.other_work (n int)"))
+        .execute(&pool)
+        .await
+        .unwrap();
     let gid = format!("pg-bus-test-{}", std::process::id());
     let mut conn = pool.acquire().await.unwrap();
     sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
-    bus.publish(&mut conn, "/a", &json!("prepared"), None)
+    sqlx::query(&format!("INSERT INTO {schema}.other_work VALUES (1)"))
+        .execute(&mut *conn)
         .await
         .unwrap();
     sqlx::query(&format!("PREPARE TRANSACTION '{gid}'"))
@@ -116,4 +129,25 @@ async fn a_forgotten_prepared_transaction_shows_up_as_the_blocker() {
         report.contains(&format!("prepared transaction {gid:?}")),
         "{report}"
     );
+}
+
+/// Publishing sends a NOTIFY, and Postgres will not PREPARE a transaction
+/// that has: a transaction that publishes cannot use two-phase commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_that_publishes_cannot_be_prepared() {
+    let (bus, pool) = bus().await;
+    if !prepared_transactions_on(&pool).await {
+        return;
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+    bus.publish(&mut conn, "/a", &json!("x"), None)
+        .await
+        .unwrap();
+    let error = sqlx::query("PREPARE TRANSACTION 'pg-bus-refused'")
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+    sqlx::query("ROLLBACK").execute(&mut *conn).await.unwrap();
+    assert!(error.to_string().contains("NOTIFY"), "{error}");
 }

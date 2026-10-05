@@ -225,6 +225,9 @@ impl Bus {
     /// Writes a message in the caller's transaction. It is delivered once
     /// that transaction commits, and never if it rolls back. Returns its
     /// position, which a client that made the change can resume from.
+    ///
+    /// The transaction cannot then use two-phase commit: publishing queues a
+    /// NOTIFY, and Postgres refuses to PREPARE a transaction that has one.
     pub async fn publish(
         &self,
         conn: &mut PgConnection,
