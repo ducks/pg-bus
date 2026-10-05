@@ -42,6 +42,8 @@ pub(crate) async fn migrate(pool: &PgPool, schema: &str) -> Result<(), Error> {
         format!(
             "CREATE INDEX IF NOT EXISTS messages_channel ON {schema}.messages (channel, xid, id)"
         ),
+        // Trimming by age.
+        format!("CREATE INDEX IF NOT EXISTS messages_created_at ON {schema}.messages (created_at)"),
         // The newest position trim has deleted: cursors below it have gaps.
         format!(
             "CREATE TABLE IF NOT EXISTS {schema}.state ( \
