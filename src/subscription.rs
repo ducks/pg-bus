@@ -72,6 +72,21 @@ impl Subscription {
         }
         loop {
             if let Some(message) = self.queue.pop_front() {
+                // Delivery is in strictly increasing position: anything
+                // else is a bug, loud in tests, skipped in release.
+                if message.position <= self.position {
+                    debug_assert!(
+                        false,
+                        "pg-bus: {} delivered after {} ({})",
+                        message.position, self.position, message.channel
+                    );
+                    tracing::error!(
+                        "pg-bus: skipped {} after {}: out of order",
+                        message.position,
+                        self.position
+                    );
+                    continue;
+                }
                 self.position = message.position;
                 return Ok(Item::Message(message));
             }

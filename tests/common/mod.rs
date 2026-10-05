@@ -12,8 +12,15 @@ use sqlx::PgPool;
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
 pub async fn bus_with(capacity: usize) -> (Bus, PgPool) {
+    let (bus, pool, _) = bus_in_schema(capacity).await;
+    (bus, pool)
+}
+
+/// A bus, its pool and the schema it runs in.
+pub async fn bus_in_schema(capacity: usize) -> (Bus, PgPool, String) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (run inside nix-shell)");
     let pool = PgPool::connect(&url).await.unwrap();
+    drop_stale_schemas(&pool).await;
     let schema = format!(
         "t_{}_{}",
         std::process::id(),
@@ -24,11 +31,44 @@ pub async fn bus_with(capacity: usize) -> (Bus, PgPool) {
         .await
         .unwrap();
     let config = Config {
-        schema,
+        schema: schema.clone(),
         capacity,
         ..Config::default()
     };
-    (Bus::start(pool.clone(), config).await.unwrap(), pool)
+    (
+        Bus::start(pool.clone(), config).await.unwrap(),
+        pool,
+        schema,
+    )
+}
+
+/// Drops the schemas of test processes that have exited (`t_<pid>_<n>`,
+/// the pid no longer running), one process at a time.
+async fn drop_stale_schemas(pool: &PgPool) {
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtext('pg-bus test cleanup'))")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT nspname::text FROM pg_namespace WHERE nspname ~ '^t_[0-9]+_[0-9]+$'",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    for name in names {
+        let pid = name.split('_').nth(1).unwrap_or_default();
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            sqlx::query(&format!("DROP SCHEMA IF EXISTS {name} CASCADE"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+    }
+    sqlx::query("SELECT pg_advisory_unlock(hashtext('pg-bus test cleanup'))")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 }
 
 pub async fn bus() -> (Bus, PgPool) {
@@ -49,13 +89,15 @@ pub async fn publish(
     channel: &str,
     data: Value,
     audience: Option<&[&str]>,
-) {
+) -> Position {
     let audience: Option<Vec<String>> = audience.map(|a| a.iter().map(|s| s.to_string()).collect());
     let mut tx = pool.begin().await.unwrap();
-    bus.publish(&mut tx, channel, &data, audience.as_deref())
+    let position = bus
+        .publish(&mut tx, channel, &data, audience.as_deref())
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    position
 }
 
 /// The backlog once `n` messages are deliverable. A committed message
