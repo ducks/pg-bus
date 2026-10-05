@@ -22,7 +22,9 @@ in
         echo "PostgreSQL is already running on port ${toString port}"
         return
       fi
-      pg_ctl start -w -l "$PGDATA/logfile" -o "-k $PGDATA -p ${toString port}"
+      # Prepared transactions on, for the stall test (a forgotten one holds
+      # delivery back).
+      pg_ctl start -w -l "$PGDATA/logfile" -o "-k $PGDATA -p ${toString port} -c max_prepared_transactions=10"
       psql -U postgres -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname = '$USER'" | grep -q 1 || \
         psql -U postgres -d postgres -c "CREATE ROLE \"$USER\" WITH LOGIN SUPERUSER CREATEDB"
       psql -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'pg_bus_test'" | grep -q 1 || \
