@@ -25,7 +25,7 @@ pub(crate) async fn run(pool: PgPool, config: Config, shared: Arc<Shared>, mut c
     let mut retry = config.min_poll;
     let mut connected_before = false;
     loop {
-        let mut listener = match connect(&pool, &config.schema).await {
+        let mut listener = match connect(&pool, &config).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("pg-bus: listener could not connect: {e}");
@@ -116,8 +116,13 @@ impl StallWatch {
     }
 }
 
-async fn connect(pool: &PgPool, schema: &str) -> Result<PgListener, sqlx::Error> {
-    let mut listener = PgListener::connect_with(pool).await?;
+/// The LISTEN connection: `listen_url` when set, else the pool's settings.
+async fn connect(pool: &PgPool, config: &Config) -> Result<PgListener, sqlx::Error> {
+    let mut listener = match &config.listen_url {
+        Some(url) => PgListener::connect(url).await?,
+        None => PgListener::connect_with(pool).await?,
+    };
+    let schema = &config.schema;
     listener.listen(schema).await?;
     Ok(listener)
 }

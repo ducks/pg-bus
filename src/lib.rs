@@ -14,6 +14,38 @@
 //! can commit below the horizon afterwards, a [`Position`] in that order
 //! never skips a committed message. The cost is that a long-running write
 //! transaction anywhere in the database holds delivery back until it ends.
+//!
+//! # Limits
+//!
+//! - **PostgreSQL 13 or newer.** Positions use `xid8` and
+//!   `pg_current_xact_id`; `Bus::start` refuses older servers.
+//! - **One listening connection per process,** held open for LISTEN. It must
+//!   reach PostgreSQL directly or through a pooler in session mode: LISTEN
+//!   does not work through pgbouncer in transaction mode. When the pool goes
+//!   through one, set `Config::listen_url` to a direct URL for the listener.
+//! - **Publish throughput is bounded by NOTIFY.** A transaction that sends a
+//!   notification takes a global lock at commit, so publishing transactions
+//!   commit one at a time. BENCH.md has about 4,000 single-message
+//!   transactions a second on a laptop; batching several messages into one
+//!   transaction sends one notification.
+//! - **No two-phase commit.** Publishing queues a NOTIFY, and PostgreSQL
+//!   refuses to PREPARE a transaction that has one.
+//! - **Long write transactions delay delivery.** A message is delivered once
+//!   every older write transaction in the database has ended, so one left
+//!   open (idle in transaction, a forgotten prepared transaction) holds back
+//!   everything after it. Nothing is lost, and `Bus::health` and the
+//!   listener's warning name the transaction.
+//! - **Gaps are not per channel.** A subscriber resuming from before a trim
+//!   is told it may have missed messages even when the trim was on another
+//!   channel. It reloads when it need not, never the other way round.
+//! - **Memory:** each process keeps its most recent messages
+//!   (`Config::recent`, default 10,000) for catch-ups, and each subscription
+//!   queues at most a batch.
+//! - **Channels match exactly;** there are no wildcards or prefixes.
+//! - **One order across channels:** delivery follows transaction ids (roughly
+//!   when each transaction first wrote), the same for every subscriber; a
+//!   transaction that commits late is held back, not delivered out of turn.
+//!   There are no per-channel sequence numbers.
 
 mod health;
 mod listener;
@@ -106,6 +138,9 @@ pub enum Error {
     Db(sqlx::Error),
     InvalidPosition(String),
     InvalidSchema(String),
+    /// The server is older than PostgreSQL 13 (no `xid8`); its
+    /// `server_version_num`.
+    UnsupportedServer(i64),
     /// The bus was dropped while a subscriber waited.
     Closed,
 }
@@ -116,6 +151,10 @@ impl fmt::Display for Error {
             Error::Db(e) => write!(f, "pg-bus: database: {e}"),
             Error::InvalidPosition(s) => write!(f, "pg-bus: not a position: {s:?}"),
             Error::InvalidSchema(s) => write!(f, "pg-bus: not a schema name: {s:?}"),
+            Error::UnsupportedServer(v) => write!(
+                f,
+                "pg-bus: needs PostgreSQL 13 or newer (xid8), the server is {v}"
+            ),
             Error::Closed => write!(f, "pg-bus: the bus was dropped"),
         }
     }
@@ -158,6 +197,10 @@ pub struct Config {
     /// The background trim: on by default with [`Trim`]'s defaults; `None`
     /// leaves trimming to calls of [`Bus::trim`].
     pub trim: Option<Trim>,
+    /// Where the listener connects, when the pool goes through a pooler
+    /// in transaction mode (LISTEN needs a session of its own): a direct
+    /// or session-mode URL. `None`: the pool's settings.
+    pub listen_url: Option<String>,
 }
 
 impl Default for Config {
@@ -172,6 +215,7 @@ impl Default for Config {
             recent: 10_000,
             trim_grace: Duration::from_secs(60),
             trim: Some(Trim::default()),
+            listen_url: None,
         }
     }
 }
@@ -231,6 +275,7 @@ impl Bus {
     /// Creates the schema if needed and starts the listener.
     pub async fn start(pool: PgPool, config: Config) -> Result<Bus, Error> {
         schema::validate(&config.schema)?;
+        schema::check_server(&pool).await?;
         schema::migrate(&pool, &config.schema).await?;
         let (feed, _) = broadcast::channel(config.capacity);
         let start = horizon_on(&pool).await?;
@@ -309,7 +354,7 @@ impl Bus {
 
     /// Deliverable messages after `from`, oldest first, at most `limit`.
     /// A message committed a moment ago may not be here yet: it waits until
-    /// every older write transaction has ended (see the crate docs).
+    /// every older write transaction has ended (the crate docs, Limits).
     pub async fn backlog(
         &self,
         from: Position,

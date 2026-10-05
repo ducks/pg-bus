@@ -1,4 +1,4 @@
-.PHONY: help version-bump release test clean clippy fmt fmt-check lint install-hooks
+.PHONY: help version-bump release test clean clippy fmt fmt-check doc lint install-hooks
 
 # Auto-generate version from today's date with auto-incrementing patch
 # Format: YYYYMMDD.0.X where X increments if releasing multiple times per day
@@ -26,6 +26,7 @@ help:
 	@echo "  make test                          - Run tests (db_start first)"
 	@echo "  make clippy                        - Run clippy"
 	@echo "  make fmt / fmt-check               - Format / check formatting"
+	@echo "  make doc                           - Build the docs, warnings as errors"
 	@echo "  make lint                          - All CI checks (fmt-check, clippy, tests)"
 	@echo "  make install-hooks                 - Install a pre-push hook running 'make lint'"
 	@echo "  make clean                         - Clean build artifacts"
@@ -78,8 +79,12 @@ fmt:
 fmt-check:
 	cargo fmt -- --check
 
+# The docs build without warnings (broken links, bad markup).
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
 # Run all the checks CI runs, in order. Cheap to run locally before pushing.
-lint: fmt-check clippy test
+lint: fmt-check clippy doc test
 
 # Install a pre-push hook that runs `make lint` before any push.
 install-hooks:

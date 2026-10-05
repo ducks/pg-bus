@@ -156,3 +156,23 @@ async fn a_burst_costs_nothing_once_delivered() {
         after - before
     );
 }
+
+/// With Config::listen_url, the listener connects there and not through
+/// the pool (which may go through a transaction-mode pooler).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_listener_uses_its_own_url_when_given() {
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let listen_url = format!("{url}{separator}application_name=pg-bus-listener");
+    let (bus, pool, schema) = start_bus(|c| c.listen_url = Some(listen_url)).await;
+    let mut sub = bus.subscribe(bus.now().await.unwrap(), everyone(&["/a"]));
+    publish(&bus, &pool, "/a", json!("via listen_url"), None).await;
+    assert_eq!(next(&mut sub).await.data, json!("via listen_url"));
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT application_name FROM pg_stat_activity WHERE query = $1")
+            .bind(format!("LISTEN \"{schema}\""))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(names, vec!["pg-bus-listener".to_string()]);
+}

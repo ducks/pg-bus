@@ -54,6 +54,38 @@ Ordering: a message is delivered once every older write transaction has
 ended, so a cursor never skips one that commits late. A long-running write
 transaction anywhere in the database delays delivery until it ends.
 
+## Limits
+
+- **PostgreSQL 13 or newer.** Positions use `xid8` and
+  `pg_current_xact_id`; `Bus::start` refuses older servers.
+- **One listening connection per process,** held open for LISTEN. It must
+  reach PostgreSQL directly or through a pooler in session mode: LISTEN
+  does not work through pgbouncer in transaction mode. When the pool goes
+  through one, set `Config::listen_url` to a direct URL for the listener.
+- **Publish throughput is bounded by NOTIFY.** A transaction that sends a
+  notification takes a global lock at commit, so publishing transactions
+  commit one at a time. BENCH.md has about 4,000 single-message
+  transactions a second on a laptop; batching several messages into one
+  transaction sends one notification.
+- **No two-phase commit.** Publishing queues a NOTIFY, and PostgreSQL
+  refuses to PREPARE a transaction that has one.
+- **Long write transactions delay delivery.** A message is delivered once
+  every older write transaction in the database has ended, so one left
+  open (idle in transaction, a forgotten prepared transaction) holds back
+  everything after it. Nothing is lost, and `Bus::health` and the
+  listener's warning name the transaction.
+- **Gaps are not per channel.** A subscriber resuming from before a trim
+  is told it may have missed messages even when the trim was on another
+  channel. It reloads when it need not, never the other way round.
+- **Memory:** each process keeps its most recent messages
+  (`Config::recent`, default 10,000) for catch-ups, and each subscription
+  queues at most a batch.
+- **Channels match exactly;** there are no wildcards or prefixes.
+- **One order across channels:** delivery follows transaction ids (roughly
+  when each transaction first wrote), the same for every subscriber; a
+  transaction that commits late is held back, not delivered out of turn.
+  There are no per-channel sequence numbers.
+
 ## Development
 
 ```bash
