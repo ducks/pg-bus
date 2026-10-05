@@ -9,3 +9,10 @@ keywords = ["postgres", "pubsub", "sse", "messagebus", "outbox"]
 categories = ["database", "web-programming"]
 
 [dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "json", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros"] }
