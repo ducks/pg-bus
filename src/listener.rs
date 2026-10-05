@@ -8,12 +8,13 @@
 //! every `idle_poll` in case a notification was missed.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tokio::sync::broadcast;
 
+use crate::health::{health_on, stall_report};
 use crate::{Config, Message, Position, backlog_on, pending_after};
 
 /// Messages read per query; a full batch is followed by another at once.
@@ -38,6 +39,7 @@ pub(crate) async fn run(
         };
         retry = config.min_poll;
         let mut wait = config.min_poll;
+        let mut stall = StallWatch::default();
         loop {
             match drain(&pool, &config.schema, &feed, &mut cursor).await {
                 Ok(()) => {}
@@ -50,6 +52,9 @@ pub(crate) async fn run(
             let pending = pending_after(&pool, &config.schema, cursor)
                 .await
                 .unwrap_or(true);
+            if pending {
+                stall.check(&pool, &config).await;
+            }
             let delay = if pending {
                 let d = wait;
                 wait = (wait * 2).min(config.max_poll);
@@ -65,6 +70,39 @@ pub(crate) async fn run(
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Rate limits for the stall warning: looks every `CHECK` while messages
+/// wait, warns at most every `REPEAT`.
+#[derive(Default)]
+struct StallWatch {
+    checked: Option<Instant>,
+    warned: Option<Instant>,
+}
+
+impl StallWatch {
+    const CHECK: Duration = Duration::from_secs(10);
+    const REPEAT: Duration = Duration::from_secs(60);
+
+    async fn check(&mut self, pool: &PgPool, config: &Config) {
+        if self.checked.is_some_and(|c| c.elapsed() < Self::CHECK) {
+            return;
+        }
+        self.checked = Some(Instant::now());
+        let health = match health_on(pool, &config.schema).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("pg-bus: could not check for stalls: {e}");
+                return;
+            }
+        };
+        if let Some(report) = stall_report(&health, config.stall_warning)
+            && self.warned.is_none_or(|w| w.elapsed() >= Self::REPEAT)
+        {
+            self.warned = Some(Instant::now());
+            tracing::warn!("{report}");
         }
     }
 }

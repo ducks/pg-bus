@@ -15,6 +15,7 @@
 //! never skips a committed message. The cost is that a long-running write
 //! transaction anywhere in the database holds delivery back until it ends.
 
+mod health;
 mod listener;
 mod schema;
 #[cfg(feature = "axum")]
@@ -30,6 +31,7 @@ use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::broadcast;
 
+pub use health::{Blocker, Health, stall_report};
 pub use subscription::{Item, Subscription};
 
 /// Where a subscriber is in the bus: the last message it has seen, as
@@ -136,6 +138,9 @@ pub struct Config {
     pub max_poll: Duration,
     /// Without a notification, the listener still looks this often.
     pub idle_poll: Duration,
+    /// The listener logs a warning (at most once a minute) when a committed
+    /// message has waited longer than this behind an open transaction.
+    pub stall_warning: Duration,
 }
 
 impl Default for Config {
@@ -146,6 +151,7 @@ impl Default for Config {
             min_poll: Duration::from_millis(20),
             max_poll: Duration::from_secs(1),
             idle_poll: Duration::from_secs(30),
+            stall_warning: Duration::from_secs(30),
         }
     }
 }
@@ -244,6 +250,12 @@ impl Bus {
             .execute(&mut *conn)
             .await?;
         Ok(Position { xid, id })
+    }
+
+    /// What waits behind the delivery horizon and the transactions holding
+    /// it, for monitoring (see [`Health`]).
+    pub async fn health(&self) -> Result<Health, Error> {
+        health::health_on(&self.inner.pool, self.schema()).await
     }
 
     /// The position a new subscriber starts from: after every message
