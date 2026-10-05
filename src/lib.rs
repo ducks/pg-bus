@@ -171,8 +171,10 @@ impl Drop for Inner {
 }
 
 /// The columns a message is read with, in [`Message`]'s order plus the
-/// position.
-const COLUMNS: &str = "xid::text, id, channel, data, audience";
+/// position. The transaction id comes out as text under its own name: an
+/// output column called `xid` would be what an unqualified `ORDER BY xid`
+/// sorts by, and as text "1000000" sorts before "999997".
+const COLUMNS: &str = "messages.xid::text AS xid_text, messages.id, messages.channel, messages.data, messages.audience";
 
 type Row = (String, i64, String, Value, Option<Vec<String>>);
 
@@ -215,30 +217,33 @@ impl Bus {
     }
 
     /// Writes a message in the caller's transaction. It is delivered once
-    /// that transaction commits, and never if it rolls back.
+    /// that transaction commits, and never if it rolls back. Returns its
+    /// position, which a client that made the change can resume from.
     pub async fn publish(
         &self,
         conn: &mut PgConnection,
         channel: &str,
         data: &Value,
         audience: Option<&[String]>,
-    ) -> Result<(), Error> {
+    ) -> Result<Position, Error> {
         let schema = self.schema();
-        sqlx::query(&format!(
-            "INSERT INTO {schema}.messages (channel, data, audience) VALUES ($1, $2, $3)"
+        let (xid, id): (String, i64) = sqlx::query_as(&format!(
+            "INSERT INTO {schema}.messages (channel, data, audience) VALUES ($1, $2, $3) \
+             RETURNING xid::text, id"
         ))
         .bind(channel)
         .bind(data)
         .bind(audience)
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await?;
+        let xid = xid.parse().map_err(|_| Error::InvalidPosition(xid))?;
         // Postgres sends it at commit, once per transaction however many
         // messages it wrote.
         sqlx::query("SELECT pg_notify($1, '')")
             .bind(schema)
             .execute(&mut *conn)
             .await?;
-        Ok(())
+        Ok(Position { xid, id })
     }
 
     /// The position a new subscriber starts from: after every message
@@ -360,7 +365,7 @@ pub(crate) async fn backlog_on(
         "SELECT {COLUMNS} FROM {schema}.messages \
          WHERE (xid, id) > ($1::text::xid8, $2) \
            AND xid < pg_snapshot_xmin(pg_current_snapshot()) {filter_sql} \
-         ORDER BY xid, id LIMIT $3"
+         ORDER BY messages.xid, messages.id LIMIT $3"
     );
     let mut q = sqlx::query_as::<_, Row>(&sql)
         .bind(from.xid.to_string())
