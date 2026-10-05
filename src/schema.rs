@@ -19,6 +19,24 @@ pub(crate) fn validate(schema: &str) -> Result<(), Error> {
     }
 }
 
+/// The oldest PostgreSQL with `xid8` and `pg_current_xact_id`.
+const MINIMUM_SERVER: i64 = 130_000;
+
+/// Refuses servers without `xid8`, which every query here needs.
+pub(crate) fn supported(server_version_num: i64) -> Result<(), Error> {
+    if server_version_num < MINIMUM_SERVER {
+        return Err(Error::UnsupportedServer(server_version_num));
+    }
+    Ok(())
+}
+
+pub(crate) async fn check_server(pool: &PgPool) -> Result<(), Error> {
+    let version: String = sqlx::query_scalar("SHOW server_version_num")
+        .fetch_one(pool)
+        .await?;
+    supported(version.trim().parse().unwrap_or(0))
+}
+
 /// Creates the schema, the backlog and the state row if missing.
 pub(crate) async fn migrate(pool: &PgPool, schema: &str) -> Result<(), Error> {
     let mut tx = pool.begin().await?;
@@ -62,6 +80,16 @@ pub(crate) async fn migrate(pool: &PgPool, schema: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::validate;
+
+    #[test]
+    fn needs_postgresql_13() {
+        assert!(super::supported(130_000).is_ok());
+        assert!(super::supported(160_010).is_ok());
+        assert!(matches!(
+            super::supported(120_017),
+            Err(crate::Error::UnsupportedServer(120_017))
+        ));
+    }
 
     #[test]
     fn schema_names_are_plain_identifiers() {
