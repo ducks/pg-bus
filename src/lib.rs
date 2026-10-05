@@ -22,6 +22,7 @@ mod schema;
 #[cfg(feature = "axum")]
 pub mod sse;
 mod subscription;
+mod trim;
 
 use std::fmt;
 use std::str::FromStr;
@@ -34,6 +35,7 @@ use tokio::sync::broadcast;
 
 pub use health::{Blocker, Health, stall_report};
 pub use subscription::{Item, Subscription};
+pub use trim::Trim;
 
 /// Where a subscriber is in the bus: the last message it has seen, as
 /// `(transaction id, message id)`. Opaque to clients, which hand back its
@@ -151,6 +153,9 @@ pub struct Config {
     /// gap check, which holds only if trim never deletes a message that
     /// listener has not read yet.
     pub trim_grace: Duration,
+    /// The background trim: on by default with [`Trim`]'s defaults; `None`
+    /// leaves trimming to calls of [`Bus::trim`].
+    pub trim: Option<Trim>,
 }
 
 impl Default for Config {
@@ -164,6 +169,7 @@ impl Default for Config {
             stall_warning: Duration::from_secs(30),
             recent: 10_000,
             trim_grace: Duration::from_secs(60),
+            trim: Some(Trim::default()),
         }
     }
 }
@@ -181,11 +187,13 @@ struct Inner {
     feed: broadcast::Sender<Arc<Message>>,
     recent: Arc<Mutex<recent::Recent>>,
     listener: tokio::task::JoinHandle<()>,
+    trimmer: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         self.listener.abort();
+        self.trimmer.abort();
     }
 }
 
@@ -223,6 +231,7 @@ impl Bus {
             recent.clone(),
             start,
         ));
+        let trimmer = tokio::spawn(trim::run(pool.clone(), config.clone()));
         Ok(Bus {
             inner: Arc::new(Inner {
                 pool,
@@ -230,6 +239,7 @@ impl Bus {
                 feed,
                 recent,
                 listener,
+                trimmer,
             }),
         })
     }
@@ -317,47 +327,20 @@ impl Bus {
     /// all but the newest `keep_per_channel`. Returns how many went. Never
     /// deletes a message younger than [`Config::trim_grace`]: a listener may
     /// not have read it yet, and its subscribers would miss it unawares.
+    /// Waits while another process trims (the background task, see
+    /// [`Config::trim`], does not: it skips the round).
     pub async fn trim(&self, max_age: Duration, keep_per_channel: i64) -> Result<u64, Error> {
-        let schema = self.schema();
-        let mut tx = self.inner.pool.begin().await?;
-        let deleted: Vec<(String, i64)> = sqlx::query_as(&format!(
-            "WITH horizon AS (SELECT pg_snapshot_xmin(pg_current_snapshot()) AS xmin), \
-                  ranked AS ( \
-                    SELECT id, row_number() OVER (PARTITION BY channel ORDER BY xid DESC, id DESC) AS n \
-                    FROM {schema}.messages) \
-             DELETE FROM {schema}.messages m USING horizon, ranked r \
-             WHERE r.id = m.id AND m.xid < horizon.xmin \
-               AND m.created_at < now() - make_interval(secs => $3) \
-               AND (m.created_at < now() - make_interval(secs => $1) OR r.n > $2) \
-             RETURNING m.xid::text, m.id"
-        ))
-        .bind(max_age.as_secs_f64())
-        .bind(keep_per_channel)
-        .bind(self.inner.config.trim_grace.as_secs_f64())
-        .fetch_all(&mut *tx)
+        let config = &self.inner.config;
+        let deleted = trim::trim_on(
+            &self.inner.pool,
+            &config.schema,
+            config.trim_grace,
+            max_age,
+            keep_per_channel,
+            true,
+        )
         .await?;
-        // The newest position trimmed: a cursor below it may have missed
-        // something.
-        let mut newest: Option<Position> = None;
-        for (xid, id) in &deleted {
-            let xid: u64 = xid
-                .parse()
-                .map_err(|_| Error::InvalidPosition(xid.clone()))?;
-            let p = Position { xid, id: *id };
-            newest = Some(newest.map_or(p, |n| n.max(p)));
-        }
-        if let Some(p) = newest {
-            sqlx::query(&format!(
-                "UPDATE {schema}.state SET trimmed_xid = $1::text::xid8, trimmed_id = $2 \
-                 WHERE ($1::text::xid8, $2) > (trimmed_xid, trimmed_id)"
-            ))
-            .bind(p.xid.to_string())
-            .bind(p.id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(deleted.len() as u64)
+        Ok(deleted.unwrap_or(0))
     }
 
     /// Subscribes from `from` (see [`Bus::now`] for a new subscriber):
